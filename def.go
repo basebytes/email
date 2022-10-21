@@ -45,7 +45,11 @@ func (m *Message) content() string {
 type addressSlice []*mail.Address
 
 func (a addressSlice) String() string {
-	return strings.Join(a.Addr(), ",")
+	var addr []string
+	for _, add := range a {
+		addr = append(addr, add.String())
+	}
+	return strings.Join(addr, ",")
 }
 
 func (a addressSlice) Addr() (addr []string) {
