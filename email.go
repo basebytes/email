@@ -18,7 +18,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 func NewClient(config *Config) (client Client, err error) {
@@ -38,6 +37,9 @@ func NewClient(config *Config) (client Client, err error) {
 		}
 		client.queue = make(chan *letter, config.MaxQueueSize)
 		client.stopped = make(chan struct{}, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		client.cancel = cancel
+		go client.waitForLetter(ctx)
 	}
 	return
 }
@@ -159,58 +161,19 @@ func AttachmentMessage(name, filePath, contentId string) *Message {
 }
 
 type Client struct {
-	server     string
-	user       *mail.Address
-	auth       smtp.Auth
-	port       int
-	smtpClient *smtp.Client
-	queue      chan *letter
-	lock       sync.Mutex
-	isRunning  bool
-	cancel     context.CancelFunc
-	stopped    chan struct{}
+	server    string
+	user      *mail.Address
+	auth      smtp.Auth
+	port      int
+	queue     chan *letter
+	isRunning bool
+	cancel    context.CancelFunc
+	stopped   chan struct{}
 }
 
-func (c *Client) Connect() error {
-	if c.smtpClient == nil {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-		if c.smtpClient == nil {
-			server := fmt.Sprintf("%s:%d", c.server, c.port)
-			conn, err := tls.Dial("tcp", server, &tls.Config{ServerName: c.server})
-			if err != nil {
-				err = fmt.Errorf("连接服务[%s]失败，%s", server, err)
-			} else if c.smtpClient, err = smtp.NewClient(conn, c.server); err != nil {
-				err = fmt.Errorf("创建客户端失败，%s", err)
-			} else if err = c.smtpClient.Hello("localhost"); err != nil {
-				err = fmt.Errorf("通信失败，%s", err)
-			} else if ok, _ := c.smtpClient.Extension("AUTH"); !ok {
-				err = fmt.Errorf("服务器不支持AUTH扩展")
-			} else if err = c.smtpClient.Auth(c.auth); err != nil {
-				err = fmt.Errorf("身份认证失败，%s", err)
-			} else if err = c.smtpClient.Mail(c.user.Address); err != nil {
-				err = fmt.Errorf("启动邮件事务失败，%s", err)
-			} else {
-				ctx, cancel := context.WithCancel(context.Background())
-				c.cancel = cancel
-				go c.waitForLetter(ctx)
-			}
-			if err != nil && c.smtpClient != nil {
-				_ = c.smtpClient.Close()
-				c.smtpClient = nil
-			}
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Client) Close() (err error) {
+func (c *Client) Close() {
 	c.cancel()
 	<-c.stopped
-	err = c.smtpClient.Quit()
-	c.smtpClient = nil
-	return err
 }
 
 func (c *Client) waitForLetter(ctx context.Context) {
@@ -241,17 +204,44 @@ func (c *Client) waitForLetter(ctx context.Context) {
 	}
 }
 
-func (c *Client) send(_letter *letter) (err error) {
+func (c *Client) send(_letter *letter) error {
+	client, err := c.smtpClient()
+	if err != nil {
+		return err
+	}
 	for _, addr := range _letter.addresses {
-		if err = c.smtpClient.Rcpt(addr); err != nil {
+		if err = client.Rcpt(addr); err != nil {
 			return err
 		}
 	}
 	var writer io.WriteCloser
-	if writer, err = c.smtpClient.Data(); err == nil {
+	if writer, err = client.Data(); err == nil {
 		if _, err = writer.Write(_letter.content); err == nil {
 			err = writer.Close()
 		}
+	}
+	if err == nil {
+		_ = client.Quit()
+	}
+	return err
+}
+
+func (c *Client) smtpClient() (client *smtp.Client, err error) {
+	server := fmt.Sprintf("%s:%d", c.server, c.port)
+	var conn *tls.Conn
+	conn, err = tls.Dial("tcp", server, &tls.Config{ServerName: c.server})
+	if err != nil {
+		err = fmt.Errorf("连接服务[%s]失败，%s", server, err)
+	} else if client, err = smtp.NewClient(conn, c.server); err != nil {
+		err = fmt.Errorf("创建客户端失败，%s", err)
+	} else if err = client.Hello("localhost"); err != nil {
+		err = fmt.Errorf("通信失败，%s", err)
+	} else if ok, _ := client.Extension("AUTH"); !ok {
+		err = fmt.Errorf("服务器不支持AUTH扩展")
+	} else if err = client.Auth(c.auth); err != nil {
+		err = fmt.Errorf("身份认证失败，%s", err)
+	} else if err = client.Mail(c.user.Address); err != nil {
+		err = fmt.Errorf("启动邮件事务失败，%s", err)
 	}
 	return
 }
