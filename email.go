@@ -20,7 +20,8 @@ import (
 	"strings"
 )
 
-func NewClient(config *Config) (client Client, err error) {
+func NewClient(config *Config) (client *Client, err error) {
+	client = &Client{}
 	if client.user, err = mail.ParseAddress(config.User); err != nil {
 		err = fmt.Errorf("Invalid user format %s:%s ", config.User, err.Error())
 	} else if config.Server == "" {
