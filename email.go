@@ -136,19 +136,9 @@ func TextMessage(format string, args ...interface{}) *Message {
 	)
 }
 
-//AttachmentMessage 附件消息
-func AttachmentMessage(name, filePath, contentId string) *Message {
-	header := map[string][]string{
-		"Content-Disposition": {"attachment;filename=" + name},
-	}
-	if contentId != "" {
-		header["Content-ID"] = []string{contentId}
-	}
-
-	contentType := contentType8bit
-	if t := mime.TypeByExtension(path.Ext(name)); t != "" {
-		contentType = t
-	}
+//AttachmentFileMessage 附件消息
+func AttachmentFileMessage(name, contentId, filePath string) *Message {
+	header, contentType := getAttachmentHeader(name, contentId)
 	content := ""
 	if attData, err := ioutil.ReadFile(filePath); err == nil {
 		content = base64.StdEncoding.EncodeToString(attData)
@@ -159,6 +149,31 @@ func AttachmentMessage(name, filePath, contentId string) *Message {
 		header,
 		content,
 	)
+}
+
+//AttachmentRawDataMessage 附件消息
+func AttachmentRawDataMessage(name, contentId string, attRawData []byte) *Message {
+	header, contentType := getAttachmentHeader(name, contentId)
+	return newMessage(
+		contentType,
+		encodingBase64,
+		header,
+		base64.StdEncoding.EncodeToString(attRawData),
+	)
+}
+
+func getAttachmentHeader(name, contentId string) (map[string][]string, string) {
+	header := map[string][]string{
+		"Content-Disposition": {"attachment;filename=" + name},
+	}
+	if contentId != "" {
+		header["Content-ID"] = []string{contentId}
+	}
+	contentType := contentType8bit
+	if t := mime.TypeByExtension(path.Ext(name)); t != "" {
+		contentType = t
+	}
+	return header, contentType
 }
 
 type Client struct {
