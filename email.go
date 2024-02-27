@@ -246,13 +246,13 @@ func (c *Client) send(_letter *letter) {
 		var writer io.WriteCloser
 		if writer, err = client.Data(); err == nil {
 			if _, err = writer.Write(_letter.content); err == nil {
-				err = writer.Close()
+				if err = writer.Close(); err == nil {
+					_ = client.Quit()
+				}
 			}
 		}
 	}
-	if err == nil {
-		_ = client.Quit()
-	} else if _letter.callback != nil {
+	if _letter.callback != nil {
 		_letter.callback(_letter.key, err)
 	}
 }
