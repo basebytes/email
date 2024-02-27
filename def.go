@@ -63,6 +63,8 @@ type params struct {
 	user      *mail.Address
 	headers   map[string]string
 	addresses []string
+	key       string
+	callback  func(key string, err error)
 }
 
 func (p *params) Add(k, v string) {
@@ -77,8 +79,19 @@ func (p *params) writeHeaders(buffer *bytes.Buffer) {
 }
 
 type letter struct {
+	key       string
 	addresses []string
 	content   []byte
+	callback  func(string, error)
+}
+
+func newLetter(content []byte, params *params) *letter {
+	l := &letter{content: content, addresses: params.addresses}
+	if params.callback != nil {
+		l.callback = params.callback
+		l.key = params.key
+	}
+	return l
 }
 
 func newParams(user mail.Address, to addressSlice) *params {

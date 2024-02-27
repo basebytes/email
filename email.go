@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"mime"
 	"mime/multipart"
 	"net/mail"
@@ -18,6 +17,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 func NewClient(config *Config) (client *Client, err error) {
@@ -106,6 +106,22 @@ func Subject(subject string) Option {
 	}
 }
 
+// Callback 回调函数
+func Callback(f func(string, error)) Option {
+	return func(params *params) {
+		if f != nil {
+			params.callback = f
+		}
+	}
+}
+
+// Key 邮件标识
+func Key(key string) Option {
+	return func(params *params) {
+		params.key = key
+	}
+}
+
 func withBoundary(boundary string) Option {
 	return func(params *params) {
 		params.headers["Content-Type"] = fmt.Sprintf("%s;boundary=%s", contentTypeMixed, boundary)
@@ -177,14 +193,15 @@ func getAttachmentHeader(name, contentId string) (map[string][]string, string) {
 }
 
 type Client struct {
-	server    string
-	user      *mail.Address
-	auth      smtp.Auth
-	port      int
-	queue     chan *letter
-	isRunning bool
+	server string
+	user   *mail.Address
+	auth   smtp.Auth
+	port   int
+	queue  chan *letter
+	//isRunning bool
 	cancel    context.CancelFunc
 	stopped   chan struct{}
+	isRunning int32
 }
 
 func (c *Client) Close() {
@@ -193,15 +210,13 @@ func (c *Client) Close() {
 }
 
 func (c *Client) waitForLetter(ctx context.Context) {
-	c.isRunning = true
+	atomic.StoreInt32(&c.isRunning, 1)
 	defer func() {
-		c.isRunning = false
+		atomic.StoreInt32(&c.isRunning, 0)
 		for {
 			select {
 			case _letter := <-c.queue:
-				if err := c.send(_letter); err != nil {
-					log.Println(err) //TODO add callback
-				}
+				c.send(_letter)
 			default:
 				c.stopped <- struct{}{}
 				return
@@ -211,35 +226,35 @@ func (c *Client) waitForLetter(ctx context.Context) {
 	for {
 		select {
 		case _letter := <-c.queue:
-			if err := c.send(_letter); err != nil {
-				log.Println(err) //TODO add callback
-			}
+			c.send(_letter)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (c *Client) send(_letter *letter) error {
+func (c *Client) send(_letter *letter) {
 	client, err := c.smtpClient()
-	if err != nil {
-		return err
-	}
-	for _, addr := range _letter.addresses {
-		if err = client.Rcpt(addr); err != nil {
-			return err
+	if err == nil {
+		for _, addr := range _letter.addresses {
+			if err = client.Rcpt(addr); err != nil {
+				break
+			}
 		}
 	}
-	var writer io.WriteCloser
-	if writer, err = client.Data(); err == nil {
-		if _, err = writer.Write(_letter.content); err == nil {
-			err = writer.Close()
+	if err == nil {
+		var writer io.WriteCloser
+		if writer, err = client.Data(); err == nil {
+			if _, err = writer.Write(_letter.content); err == nil {
+				err = writer.Close()
+			}
 		}
 	}
 	if err == nil {
 		_ = client.Quit()
+	} else if _letter.callback != nil {
+		_letter.callback(_letter.key, err)
 	}
-	return err
 }
 
 func (c *Client) smtpClient() (client *smtp.Client, err error) {
@@ -263,7 +278,7 @@ func (c *Client) smtpClient() (client *smtp.Client, err error) {
 }
 
 func (c *Client) Send(to string, messages []*Message, options ...Option) error {
-	if !c.isRunning {
+	if atomic.LoadInt32(&c.isRunning) == 0 {
 		return connectionClosedErr
 	}
 	toAddr, err := mail.ParseAddressList(to)
@@ -290,7 +305,7 @@ func (c *Client) Send(to string, messages []*Message, options ...Option) error {
 		}
 	}
 	_ = w.Close()
-	c.queue <- &letter{addresses: ps.addresses, content: buffer.Bytes()}
+	c.queue <- newLetter(buffer.Bytes(), ps)
 	return nil
 }
 
