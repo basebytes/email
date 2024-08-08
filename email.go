@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,7 +12,6 @@ import (
 	"mime/multipart"
 	"net/mail"
 	"net/smtp"
-	"net/textproto"
 	"path"
 	"strconv"
 	"strings"
@@ -49,7 +47,7 @@ func NewClient(config *Config) (client *Client, err error) {
 func SenderName(name string) Option {
 	return func(params *params) {
 		params.user = &mail.Address{Name: name, Address: params.user.Address}
-		params.Add("From", params.user.String())
+		params.Add(headerFrom, params.user.String())
 	}
 }
 
@@ -60,7 +58,7 @@ func ReturnPath(returnPath string) Option {
 			return
 		}
 		if arr, err := mail.ParseAddress(returnPath); err == nil {
-			params.Add("Return-Path", arr.Address)
+			params.Add(headerReturnPath, arr.Address)
 		}
 	}
 }
@@ -72,7 +70,7 @@ func ReplyTo(replyTo string) Option {
 			return
 		}
 		if arr, err := mail.ParseAddress(replyTo); err == nil {
-			params.Add("Reply-To", arr.Address)
+			params.Add(headerReplyTo, arr.Address)
 		}
 	}
 }
@@ -81,7 +79,7 @@ func ReplyTo(replyTo string) Option {
 func Cc(cc string) Option {
 	return func(params *params) {
 		if ccAddr, err := mail.ParseAddressList(cc); err == nil {
-			params.Add("Cc", addressSlice(ccAddr).String())
+			params.Add(headerCc, addressSlice(ccAddr).String())
 			params.addresses = append(params.addresses, addressSlice(ccAddr).Addr()...)
 		}
 	}
@@ -102,12 +100,12 @@ func Subject(subject string) Option {
 		if subject == "" {
 			return
 		}
-		params.Add("Subject", subject)
+		params.Add(headerSubject, subject)
 	}
 }
 
 // Callback 回调函数
-func Callback(f func(string, error)) Option {
+func Callback(f func(string, []string, []byte, error)) Option {
 	return func(params *params) {
 		if f != nil {
 			params.callback = f
@@ -122,19 +120,13 @@ func Key(key string) Option {
 	}
 }
 
-func withBoundary(boundary string) Option {
-	return func(params *params) {
-		params.headers["Content-Type"] = fmt.Sprintf("%s;boundary=%s", contentTypeMixed, boundary)
-	}
-}
-
 // HtmlMessage html消息
 func HtmlMessage(format string, args ...interface{}) *Message {
 	return newMessage(
 		contentTypeHtml,
 		encodingQuotedPrintable,
 		map[string][]string{
-			"Content-Disposition": {"inline"},
+			headerContentDisposition: {"inline"},
 		},
 		fmt.Sprintf(format, args...),
 	)
@@ -146,7 +138,7 @@ func TextMessage(format string, args ...interface{}) *Message {
 		contentTypeText,
 		encodingBase64,
 		map[string][]string{
-			"Content-Disposition": {"inline"},
+			headerContentDisposition: {"inline"},
 		},
 		base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(format, args...))),
 	)
@@ -178,12 +170,56 @@ func AttachmentRawDataMessage(name, contentId string, attRawData []byte) *Messag
 	)
 }
 
+//ParseContent 解析邮件内容
+func ParseContent(content []byte) (emailContent *Content) {
+	emailContent = NewContent()
+	var (
+		_boundary []byte
+		isFile    bool
+	)
+	contentSlice := bytes.Split(content, crlf)
+	for _, c := range contentSlice {
+		if len(c) == 0 {
+			continue
+		}
+		if kv := bytes.Split(c, kvSeparator); len(kv) == 2 {
+			switch k := string(kv[0]); k {
+			case headerSubject:
+				emailContent.Subject = string(kv[1])
+			case headerContentType:
+				if b := bytes.Split(kv[1], boundary); len(b) == 2 {
+					_boundary = b[1]
+				}
+			case headerContentDisposition:
+				if f := bytes.Split(kv[1], filename); len(f) == 2 {
+					emailContent.AppendAtt(NewAttachment(string(f[1])))
+					isFile = true
+				}
+			}
+		} else if !bytes.Contains(c, _boundary) {
+			if isFile {
+				emailContent.AppendAttContent(c)
+				isFile = false
+			} else {
+				emailContent.Html = string(c)
+			}
+		}
+	}
+	return
+}
+
+func withBoundary(boundary string) Option {
+	return func(params *params) {
+		params.headers[headerContentType] = fmt.Sprintf("%s;boundary=%s", contentTypeMixed, boundary)
+	}
+}
+
 func getAttachmentHeader(name, contentId string) (map[string][]string, string) {
 	header := map[string][]string{
-		"Content-Disposition": {"attachment;filename=" + name},
+		headerContentDisposition: {"attachment;filename=" + name},
 	}
 	if contentId != "" {
-		header["Content-ID"] = []string{contentId}
+		header[headerContentID] = []string{contentId}
 	}
 	contentType := contentType8bit
 	if t := mime.TypeByExtension(path.Ext(name)); t != "" {
@@ -193,12 +229,11 @@ func getAttachmentHeader(name, contentId string) (map[string][]string, string) {
 }
 
 type Client struct {
-	server string
-	user   *mail.Address
-	auth   smtp.Auth
-	port   int
-	queue  chan *letter
-	//isRunning bool
+	server    string
+	user      *mail.Address
+	auth      smtp.Auth
+	port      int
+	queue     chan *letter
 	cancel    context.CancelFunc
 	stopped   chan struct{}
 	isRunning int32
@@ -207,6 +242,58 @@ type Client struct {
 func (c *Client) Close() {
 	c.cancel()
 	<-c.stopped
+}
+
+func (c *Client) Closed() bool {
+	return atomic.LoadInt32(&c.isRunning) == 0
+}
+
+func (c *Client) Send(to string, messages []*Message, options ...Option) {
+	var (
+		toAddr []*mail.Address
+		err    error
+		ps     = newParams(*c.user)
+		buffer = bytes.NewBuffer(nil)
+		w      = multipart.NewWriter(buffer)
+	)
+	options = append(options, withBoundary(w.Boundary()))
+	for _, option := range options {
+		option(ps)
+	}
+	defer func(err *error) {
+		if err != nil && ps.callback != nil {
+			ps.callback(ps.key, ps.addresses, buffer.Bytes(), *err)
+		}
+		_ = w.Close()
+	}(&err)
+	if toAddr, err = mail.ParseAddressList(to); err != nil {
+		return
+	}
+	ps.addresses = addressSlice(toAddr).Addr()
+	ps.headers[headerTo] = addressSlice(toAddr).String()
+	ps.writeHeaders(buffer)
+	for _, message := range messages {
+		iw, e := w.CreatePart(message.h)
+		if e == nil {
+			if _, e = iw.Write([]byte(message.c)); e == nil {
+				_, e = iw.Write(crlf)
+			}
+		}
+		if e != nil {
+			buffer.Reset()
+			err = fmt.Errorf("Write email message error %s ", e.Error())
+			return
+		}
+	}
+	if c.Closed() {
+		err = connectionClosedErr
+	} else {
+		c.queue <- newLetter(buffer.Bytes(), ps)
+	}
+}
+
+func (c *Client) SendLetter(letter *letter) {
+	c.send(letter)
 }
 
 func (c *Client) waitForLetter(ctx context.Context) {
@@ -253,7 +340,7 @@ func (c *Client) send(_letter *letter) {
 		}
 	}
 	if _letter.callback != nil {
-		_letter.callback(_letter.key, err)
+		_letter.callback(_letter.key, _letter.addresses, _letter.content, err)
 	}
 }
 
@@ -276,57 +363,3 @@ func (c *Client) smtpClient() (client *smtp.Client, err error) {
 	}
 	return
 }
-
-func (c *Client) Send(to string, messages []*Message, options ...Option) error {
-	if atomic.LoadInt32(&c.isRunning) == 0 {
-		return connectionClosedErr
-	}
-	toAddr, err := mail.ParseAddressList(to)
-	if err != nil {
-		return err
-	}
-	ps := newParams(*c.user, toAddr)
-	buffer := bytes.NewBuffer(nil)
-	w := multipart.NewWriter(buffer)
-	options = append(options, withBoundary(w.Boundary()))
-	for _, option := range options {
-		option(ps)
-	}
-	ps.writeHeaders(buffer)
-	for _, message := range messages {
-		iw, e := w.CreatePart(message.h)
-		if e == nil {
-			if _, e = iw.Write([]byte(message.c)); e == nil {
-				_, e = iw.Write(crlf)
-			}
-		}
-		if e != nil {
-			return fmt.Errorf("Write email message error %s ", e.Error())
-		}
-	}
-	_ = w.Close()
-	c.queue <- newLetter(buffer.Bytes(), ps)
-	return nil
-}
-
-func newMessage(contentType, encoding string, headers map[string][]string, content string) *Message {
-	m := &Message{h: textproto.MIMEHeader{}, c: content}
-	m.h.Set("Content-Type", contentType)
-	m.h.Set("Content-Transfer-Encoding", encoding)
-	if headers != nil {
-		for k, vs := range headers {
-			if len(k) == 0 || len(vs) == 0 {
-				continue
-			}
-			for _, v := range vs {
-				if len(v) == 0 {
-					continue
-				}
-				m.h.Add(k, v)
-			}
-		}
-	}
-	return m
-}
-
-var connectionClosedErr = errors.New("Connection closed ")

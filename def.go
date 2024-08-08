@@ -2,6 +2,7 @@ package email
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/mail"
 	"net/textproto"
@@ -19,7 +20,27 @@ const (
 	defaultMaxQueueSize     = 100
 )
 
-var crlf = []byte{'\r', '\n'}
+const (
+	headerFrom                    = "From"
+	headerTo                      = "To"
+	headerReturnPath              = "Return-Path"
+	headerReplyTo                 = "Reply-To"
+	headerCc                      = "Cc"
+	headerSubject                 = "Subject"
+	headerContentType             = "Content-Type"
+	headerContentTransferEncoding = "Content-Transfer-Encoding"
+	headerContentDisposition      = "Content-Disposition"
+	headerContentID               = "Content-ID"
+	headerMimeVersion             = "Mime-Version"
+)
+
+var (
+	crlf                = []byte{'\r', '\n'}
+	kvSeparator         = []byte{':'}
+	boundary            = []byte("boundary=")
+	filename            = []byte("filename=")
+	connectionClosedErr = errors.New("Connection closed ")
+)
 
 type Config struct {
 	Server       string
@@ -30,6 +51,26 @@ type Config struct {
 
 type Option func(params *params)
 
+func newMessage(contentType, encoding string, headers map[string][]string, content string) *Message {
+	m := &Message{h: textproto.MIMEHeader{}, c: content}
+	m.h.Set(headerContentType, contentType)
+	m.h.Set(headerContentTransferEncoding, encoding)
+	if headers != nil {
+		for k, vs := range headers {
+			if len(k) == 0 || len(vs) == 0 {
+				continue
+			}
+			for _, v := range vs {
+				if len(v) == 0 {
+					continue
+				}
+				m.h.Add(k, v)
+			}
+		}
+	}
+	return m
+}
+
 type Message struct {
 	h textproto.MIMEHeader
 	c string
@@ -38,8 +79,39 @@ type Message struct {
 func (m *Message) header() textproto.MIMEHeader {
 	return m.h
 }
+
 func (m *Message) content() string {
 	return m.c
+}
+
+func NewContent() *Content {
+	return &Content{}
+}
+
+type Content struct {
+	Subject string        `gorm:"-" json:"subject,omitempty"`
+	Html    string        `gorm:"-" json:"html,omitempty"`
+	Att     []*Attachment `gorm:"-" json:"att,omitempty"`
+}
+
+func (c *Content) AppendAtt(att *Attachment) {
+	c.Att = append(c.Att, att)
+}
+
+func (c *Content) AppendAttContent(content []byte) {
+	if len(c.Att) == 0 {
+		return
+	}
+	c.Att[len(c.Att)-1].Content = content
+}
+
+func NewAttachment(name string) *Attachment {
+	return &Attachment{Name: name}
+}
+
+type Attachment struct {
+	Name    string `json:"name,omitempty"`
+	Content []byte `json:"content,omitempty"`
 }
 
 type addressSlice []*mail.Address
@@ -59,12 +131,22 @@ func (a addressSlice) Addr() (addr []string) {
 	return addr
 }
 
+func newParams(user mail.Address) *params {
+	return &params{
+		user: &user,
+		headers: map[string]string{
+			headerFrom:        user.String(),
+			headerMimeVersion: mimeVersion,
+		},
+	}
+}
+
 type params struct {
 	user      *mail.Address
 	headers   map[string]string
 	addresses []string
 	key       string
-	callback  func(key string, err error)
+	callback  func(key string, addresses []string, content []byte, err error)
 }
 
 func (p *params) Add(k, v string) {
@@ -73,16 +155,13 @@ func (p *params) Add(k, v string) {
 
 func (p *params) writeHeaders(buffer *bytes.Buffer) {
 	for key, value := range p.headers {
-		_, _ = fmt.Fprintf(buffer, "%s: %s%s", key, value, crlf)
+		_, _ = fmt.Fprintf(buffer, "%s:%s%s", key, value, crlf)
 	}
 	buffer.Write(crlf)
 }
 
-type letter struct {
-	key       string
-	addresses []string
-	content   []byte
-	callback  func(string, error)
+func NewLetter(key string, addresses []string, content []byte, callback func(string, []string, []byte, error)) *letter {
+	return &letter{key: key, addresses: addresses, content: content, callback: callback}
 }
 
 func newLetter(content []byte, params *params) *letter {
@@ -94,14 +173,9 @@ func newLetter(content []byte, params *params) *letter {
 	return l
 }
 
-func newParams(user mail.Address, to addressSlice) *params {
-	return &params{
-		user:      &user,
-		addresses: to.Addr(),
-		headers: map[string]string{
-			"From":         user.String(),
-			"To":           to.String(),
-			"Mime-Version": mimeVersion,
-		},
-	}
+type letter struct {
+	key       string
+	addresses []string
+	content   []byte
+	callback  func(string, []string, []byte, error)
 }
