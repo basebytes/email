@@ -173,11 +173,44 @@ func AttachmentRawDataMessage(name, contentId string, attRawData []byte) *Messag
 //ParseContent 解析邮件内容
 func ParseContent(content []byte) (emailContent *Content) {
 	emailContent = NewContent()
+	_boundary := extractBoundary(content, emailContent)
+	contentSlice := bytes.Split(content, _boundary)
+	for i := 1; i < len(contentSlice); i++ {
+		contents := bytes.Split(contentSlice[i], crlf)
+		if c, name := parse(contents); name == "" {
+			emailContent.Html += string(c)
+		} else {
+			emailContent.AppendAtt(NewAttachment(name))
+			emailContent.AppendAttContent(c)
+		}
+	}
+	return
+}
+
+func parse(contents [][]byte) (content []byte, fileName string) {
+	for i, c := range contents {
+		if len(c) == 0 {
+			continue
+		}
+		if kv := bytes.Split(c, kvSeparator); len(kv) == 2 {
+			if k := string(kv[0]); k == headerContentDisposition {
+				if f := bytes.Split(kv[1], filename); len(f) == 2 {
+					fileName = string(f[1])
+				}
+			}
+		} else {
+			content = bytes.TrimSpace(bytes.Join(contents[i:], crlf))
+			break
+		}
+	}
+	return
+}
+
+func extractBoundary(content []byte, emailContent *Content) []byte {
 	var (
-		_boundary []byte
-		isFile    bool
+		contentSlice = bytes.Split(content, crlf)
+		_boundary    = []byte{'-', '-'}
 	)
-	contentSlice := bytes.Split(content, crlf)
 	for _, c := range contentSlice {
 		if len(c) == 0 {
 			continue
@@ -188,24 +221,14 @@ func ParseContent(content []byte) (emailContent *Content) {
 				emailContent.Subject = string(kv[1])
 			case headerContentType:
 				if b := bytes.Split(kv[1], boundary); len(b) == 2 {
-					_boundary = b[1]
-				}
-			case headerContentDisposition:
-				if f := bytes.Split(kv[1], filename); len(f) == 2 {
-					emailContent.AppendAtt(NewAttachment(string(f[1])))
-					isFile = true
+					_boundary = append(_boundary, b[1]...)
 				}
 			}
-		} else if !bytes.Contains(c, _boundary) {
-			if isFile {
-				emailContent.AppendAttContent(c)
-				isFile = false
-			} else {
-				emailContent.Html = string(c)
-			}
+		} else if bytes.Contains(c, _boundary) {
+			break
 		}
 	}
-	return
+	return _boundary
 }
 
 func withBoundary(boundary string) Option {
@@ -261,7 +284,7 @@ func (c *Client) Send(to string, messages []*Message, options ...Option) {
 		option(ps)
 	}
 	defer func(err *error) {
-		if err != nil && ps.callback != nil {
+		if err != nil && *err != nil && ps.callback != nil {
 			ps.callback(ps.key, ps.addresses, buffer.Bytes(), *err)
 		}
 		_ = w.Close()
