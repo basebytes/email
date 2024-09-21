@@ -177,17 +177,21 @@ func ParseContent(content []byte) (emailContent *Content) {
 	contentSlice := bytes.Split(content, _boundary)
 	for i := 1; i < len(contentSlice); i++ {
 		contents := bytes.Split(contentSlice[i], crlf)
-		if c, name := parse(contents); name == "" {
-			emailContent.Html += string(c)
-		} else {
+		if c, name, htmlContent := parse(contents); name != "" {
 			emailContent.AppendAtt(NewAttachment(name))
 			emailContent.AppendAttContent(c)
+		} else if htmlContent {
+			emailContent.Html += string(c)
+		} else {
+			dest := make([]byte, base64.StdEncoding.DecodedLen(len(c)))
+			_, _ = base64.StdEncoding.Decode(dest, c)
+			emailContent.Html = string(dest)
 		}
 	}
 	return
 }
 
-func parse(contents [][]byte) (content []byte, fileName string) {
+func parse(contents [][]byte) (content []byte, fileName string, htmlContent bool) {
 	for i, c := range contents {
 		if len(c) == 0 {
 			continue
@@ -197,6 +201,8 @@ func parse(contents [][]byte) (content []byte, fileName string) {
 				if f := bytes.Split(kv[1], filename); len(f) == 2 {
 					fileName = string(f[1])
 				}
+			} else if k == headerContentType {
+				htmlContent = string(c) == contentTypeHtml
 			}
 		} else {
 			content = bytes.TrimSpace(bytes.Join(contents[i:], crlf))
