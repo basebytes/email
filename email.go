@@ -202,7 +202,7 @@ func parse(contents [][]byte) (content []byte, fileName string, htmlContent bool
 					fileName = string(f[1])
 				}
 			} else if k == headerContentType {
-				htmlContent = string(c) == contentTypeHtml
+				htmlContent = strings.TrimSpace(string(kv[1])) == contentTypeHtml
 			}
 		} else {
 			content = bytes.TrimSpace(bytes.Join(contents[i:], crlf))
